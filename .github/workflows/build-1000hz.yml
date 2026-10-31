@@ -1,0 +1,96 @@
+name: Build OpenPuck 1000Hz UF2
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-1000hz.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Fetch OpenPuck source
+        run: git clone https://github.com/safijari/openpuck.git src
+
+      - name: Apply 1000 Hz change (POLL_US_DEFAULT 4000u -> 1000u)
+        working-directory: src
+        run: |
+          set -eu
+          sed -i 's|^#define POLL_US_DEFAULT 4000u.*$|#define POLL_US_DEFAULT 1000u  // 1000 Hz (was 4000u = 250 Hz)|' OpenPuck/config.h
+          grep -n 'define POLL_US_DEFAULT' OpenPuck/config.h
+          grep -q '^#define POLL_US_DEFAULT 1000u' OpenPuck/config.h
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install adafruit-nrfutil
+        run: pip install adafruit-nrfutil
+
+      - name: Install Adafruit nRF52 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+          arduino-cli core update-index
+          arduino-cli core install adafruit:nrf52
+
+      - name: Generate version header
+        working-directory: src
+        env:
+          OPK_BUILD_VERSION: 1000hz-custom
+        run: ./gen_version.sh
+
+      - name: Build UF2
+        working-directory: src
+        run: make uf2
+
+      - name: Verify UF2
+        working-directory: src
+        run: |
+          python3 - <<'EOF'
+          import struct
+          p = 'build/openpuck/OpenPuck.ino.uf2'
+          d = open(p, 'rb').read()
+          assert len(d) % 512 == 0, 'size not a multiple of 512'
+          n = len(d) // 512
+          fam = set()
+          for i in range(n):
+              b = d[i*512:(i+1)*512]
+              m0, m1, flags, addr, size, bno, nb, fid = struct.unpack('<8I', b[:32])
+              m2 = struct.unpack('<I', b[508:512])[0]
+              assert (m0, m1, m2) == (0x0A324655, 0x9E5D5157, 0x0AB16F30), f'bad magic block {i}'
+              assert bno == i and nb == n, f'bad block numbering at {i}'
+              fam.add(fid)
+          print('blocks:', n, 'families:', [hex(f) for f in fam])
+          assert fam == {0xADA52840}, 'unexpected family id'
+          print('UF2 OK')
+          EOF
+
+      - name: Commit UF2 to repo
+        run: |
+          set -eu
+          mkdir -p firmware
+          cp src/build/openpuck/OpenPuck.ino.uf2 firmware/OpenPuck-1000Hz.uf2
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware/OpenPuck-1000Hz.uf2
+          git commit -m "Add OpenPuck 1000 Hz UF2 build"
+          git pull --rebase origin main
+          git push
+
+      - name: Upload UF2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenPuck-1000Hz.uf2
+          path: src/build/openpuck/OpenPuck.ino.uf2
